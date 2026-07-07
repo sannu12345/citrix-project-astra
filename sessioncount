@@ -1,0 +1,113 @@
+asnp citrix*
+# File with the list of servers (one per line)
+
+$machineNames = Get-Content -Path "$($PsScriptRoot)\serverlist.txt"
+
+# List of AdminAddress (DDC servers)
+$adminAddresses = Get-Content -Path "$($PsScriptRoot)\DDCList.txt"
+
+Write-Host "Servers to check:"
+$machineNames
+
+# Array to store the results
+$results = @()
+
+foreach ($machineName in $machineNames) {
+    Write-Host "Working on server: $machineName"
+    $found = $false
+    foreach ($adminAddress in $adminAddresses) {
+        # Try to find the machine in the DDC
+        $format = "ASTRAZENECA\$machineName"
+        #Write-Host "searching on: $adminAddress"
+        try{
+            $machine = Get-BrokerMachine -MachineName $format -AdminAddress $adminAddress -ErrorAction SilentlyContinue 
+        } catch {
+            Write-Host "ddc error on: $adminAddress"
+            Write-Host "Error Message: $($_.Exception.Message)" -ForegroundColor Red
+            $machine =$null
+        }
+        if ($null -ne $machine) {
+            $name = $machine.DNSName
+            #Write-Host "found on: $adminAddress  : $name"
+            if($machine.RegistrationState -eq 'Registered'){
+                
+                # ============================================================
+                # NEW CODE: Get detailed session information
+                # ============================================================
+                $activeSessions = 0
+                $disconnectedSessions = 0
+                
+                try {
+                    # Retrieve all sessions for this machine
+                    $sessions = Get-BrokerSession -MachineName $format -AdminAddress $adminAddress -ErrorAction SilentlyContinue
+                    
+                    if ($null -ne $sessions) {
+                        # Count sessions by state
+                        foreach ($session in $sessions) {
+                            if ($session.SessionState -eq 'Active') {
+                                $activeSessions++
+                            } elseif ($session.SessionState -eq 'Disconnected') {
+                                $disconnectedSessions++
+                            }
+                        }
+                    }
+                } catch {
+                    Write-Host "Error retrieving session details for $name" -ForegroundColor Yellow
+                    Write-Host "Error Message: $($_.Exception.Message)" -ForegroundColor Red
+                }
+                # ============================================================
+                # END OF NEW CODE
+                # ============================================================
+                
+                $results += [PSCustomObject]@{
+                    MachineName          = $machine.DNSName
+                    TotalSessions        = $machine.SessionCount
+                    ActiveSessions       = $activeSessions
+                    DisconnectedSessions = $disconnectedSessions
+                    InMaintenanceMode    = $machine.InMaintenanceMode
+                    RegistrationState    = $machine.RegistrationState
+                    FoundOnDDC           = $adminAddress
+                }
+                $found = $true
+                break  # Already found, no need to search in other DDCs
+            }else{
+                # The machine is not registered hence information is not accurate
+                Write-Host "$name found on: $adminAddress  but server is unregistered (information is not accurate)"
+                continue
+            }
+            
+        }
+    }
+    if (-not $found) {
+        $results += [PSCustomObject]@{
+            MachineName          = $machineName
+            TotalSessions        = "Not found"
+            ActiveSessions       = "Not found"
+            DisconnectedSessions = "Not found"
+            InMaintenanceMode    = "Not found"
+            RegistrationState    = "Not found"
+            FoundOnDDC           = "Not found"
+        }
+    }
+}
+
+# Display results in console with formatted output
+Write-Host "`n========================================" -ForegroundColor Cyan
+Write-Host "SESSION STATUS REPORT" -ForegroundColor Cyan
+Write-Host "========================================`n" -ForegroundColor Cyan
+
+foreach ($result in $results) {
+    Write-Host "Server: $($result.MachineName)" -ForegroundColor Green
+    Write-Host "  Total Sessions:        $($result.TotalSessions)"
+    Write-Host "  Active Sessions:       $($result.ActiveSessions)" -ForegroundColor Yellow
+    Write-Host "  Disconnected Sessions: $($result.DisconnectedSessions)" -ForegroundColor Magenta
+    Write-Host "  Maintenance Mode:      $($result.InMaintenanceMode)"
+    Write-Host "  Registration State:    $($result.RegistrationState)"
+    Write-Host "  Found on DDC:          $($result.FoundOnDDC)"
+    Write-Host "----------------------------------------`n"
+}
+
+# Export to CSV
+$results | Export-Csv -Path "Results.csv" -NoTypeInformation -Encoding UTF8
+
+Write-Host "Results exported to Results.csv" -ForegroundColor Green
