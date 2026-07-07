@@ -1,77 +1,190 @@
-﻿asnp citrix*
-# Archivo con la lista de servidores (uno por línea)
+<#
+    MaintenanceMode-On.ps1
+    ------------------------------------------------------------------------
+    Puts a list of Citrix VDA machines INTO maintenance mode.
 
-$machineNames = Get-Content -Path "$($PsScriptRoot)\serverlist.txt"
+    Logging: This script deliberately makes a PLAIN Set-BrokerMachineMaintenanceMode
+    call, with no custom Start-LogHighLevelOperation wrapper. Citrix Studio's
+    Logging node will show whatever it natively shows for this operation
+    (typically an "Edit Machine" entry) - this is intentional, per requirement
+    that Citrix Console logs reflect native Citrix output, not custom text.
 
-# Lista de AdminAddress (DDC servers)
-$adminAddresses = Get-Content -Path "$($PsScriptRoot)\DDCList.txt"
+    Inputs (same folder as this script):
+      - serverlist_on.txt   : one server hostname per line, servers to place
+                              INTO maintenance mode
+      - DDCList.txt         : one Delivery Controller (AdminAddress) per line
 
-Write-Host "Servers to put on mm:"
-$machineNames
-$input = Read-Host "Are you sure you want to put above server in mm ?   to continue enter 'y' or anything to abort"
+    Outputs:
+      - Console output as it runs
+      - Results_MaintenanceOn.csv (appended, so history accumulates)
+      - Pass/Fail/Not-Found summary count at the end
+------------------------------------------------------------------------ #>
 
-if ($input -eq "y") {
-    Write-Host "Working on it..."
-} else {
-    Write-Host "Canceled."
+asnp citrix*
+
+$scriptDir = $PSScriptRoot
+$domainPrefix = "ASTRAZENECA"
+
+$machineNames   = Get-Content -Path "$scriptDir\serverlist.txt"
+$adminAddresses = Get-Content -Path "$scriptDir\DDCList.txt"
+
+# Real AD identity of whoever is running the script (domain\username),
+# used purely for the local CSV audit trail - has no effect on native
+# Citrix Studio logging one way or the other.
+$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+
+Write-Host "Servers to turn MAINTENANCE MODE ON:"
+$machineNames | ForEach-Object { Write-Host "  $_" }
+Write-Host ""
+
+$reason = Read-Host "Enter a reason / ticket number for this maintenance action"
+if ([string]::IsNullOrWhiteSpace($reason)) {
+    Write-Host "A reason is required. Aborting." -ForegroundColor Red
     exit
 }
 
-# To store results
-$results = @()
+$confirm = Read-Host "Are you sure you want to turn ON maintenance mode for the above servers? Enter 'y' to continue, anything else to abort"
+if ($confirm -ne 'y') {
+    Write-Host "Canceled." -ForegroundColor Yellow
+    exit
+}
+
+$results       = @()
+$successCount  = 0
+$failCount     = 0
+$notFoundCount = 0
 
 foreach ($machineName in $machineNames) {
     Write-Host "Working on server: $machineName"
     $found = $false
+
     foreach ($adminAddress in $adminAddresses) {
-        # Intentar buscar la máquina en el DDC
-        $format = "ASTRAZENECA\$machineName"
-        #Write-Host "searching  on: $adminAddress"
-        try{
-            $machine = Get-BrokerMachine -MachineName $format -AdminAddress $adminAddress -ErrorAction SilentlyContinue 
+        $format = "$domainPrefix\$machineName"
+
+        try {
+            $machine = Get-BrokerMachine -MachineName $format -AdminAddress $adminAddress -ErrorAction SilentlyContinue
         } catch {
-            Write-Host "ddc error on: $adminAddress"
-            Write-Host "Error Message: $($_.Exception.Message)" -ForegroundColor Red
-            $machine =$null
+            Write-Host "  DDC error on: $adminAddress" -ForegroundColor Red
+            Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
+            $machine = $null
         }
-        if ($null -ne $machine) {
-            $name = $machine.DNSName
-            if($machine.RegistrationState -eq 'Registered'){
-                try{
-                    Set-BrokerMachineMaintenanceMode  -InputObject $machine $true
-                    $machine = Get-BrokerMachine -MachineName $format -AdminAddress $adminAddress -ErrorAction SilentlyContinue 
-                } catch {
-                    Write-Host "Error while putting server in maintenence mode"
-                    Write-Host "Error Message: $($_.Exception.Message)" -ForegroundColor Red
-                    $machine =$null
-                }
-                $results += [PSCustomObject]@{
-                    MachineName     = $machine.DNSName
-                    SessionCount    = $machine.SessionCount
-                    InMaintenanceMode    = $machine.InMaintenanceMode
-                    RegistrationState    = $machine.RegistrationState
-                    FoundOnDDC      = $adminAddress
-                }
-                $found = $true
-                break  # Ya encontrada, no buscar en otros DDC
-            }else{
-                #The machine is not registered hence infromation is not acurate
-                Write-Host "$name found on: $adminAddress  but server is unregistered (information is not acurate)"
-                continue
+
+        if ($null -eq $machine) {
+            continue  # not found on this DDC, try the next one
+        }
+
+        if ($machine.RegistrationState -ne 'Registered') {
+            # Found, but unregistered - data would be unreliable, so skip
+            # and keep checking the remaining DDCs in case it's registered
+            # against a different one.
+            Write-Host "  $($machine.DNSName) found on $adminAddress but is unregistered - skipping (information not accurate)" -ForegroundColor Yellow
+            continue
+        }
+
+        # -----------------------------------------------------------------
+        # Wrap in a custom high-level operation so Studio's Logging grid
+        # shows friendly text instead of generic "Edit Machine". This
+        # matches Citrix's own documented pattern exactly (see
+        # about_LogConfigurationLoggingSnapIn / Start-LogHighLevelOperation
+        # SDK docs) - it is the officially supported mechanism for scripts,
+        # not a workaround.
+        # -----------------------------------------------------------------
+        $actionText = "Turn On Maintenance Mode on Machine '$($machine.MachineName)' (via script, reason: $reason)"
+        $hlo = $null
+        try {
+            $hlo = Start-LogHighLevelOperation -Text $actionText -Source "MaintenanceMode-On.ps1" -AdminAddress $adminAddress
+        } catch {
+            Write-Host "  [LOGGING] Could not open high-level logging operation - continuing without it" -ForegroundColor Yellow
+            Write-Host "  $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+
+        $opSuccess = $true
+        try {
+            if ($hlo) {
+                Set-BrokerMachineMaintenanceMode -InputObject $machine -MaintenanceMode $true -LoggingId $hlo.Id
+            } else {
+                Set-BrokerMachineMaintenanceMode -InputObject $machine -MaintenanceMode $true
             }
-            
+            $machine = Get-BrokerMachine -MachineName $format -AdminAddress $adminAddress -ErrorAction SilentlyContinue
+        } catch {
+            $opSuccess = $false
+            Write-Host "  [FAILURE] Could not turn ON maintenance mode for $machineName" -ForegroundColor Red
+            Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
+            $machine = $null
+        } finally {
+            if ($hlo) {
+                try {
+                    Stop-LogHighLevelOperation -HighLevelOperationId $hlo.Id -IsSuccessful $opSuccess
+                } catch {
+                    Write-Host "  [LOGGING] Could not close high-level logging operation" -ForegroundColor Yellow
+                    Write-Host "  $($_.Exception.Message)" -ForegroundColor Yellow
+                }
+            }
         }
+
+        if ($opSuccess) {
+            $successCount++
+            Write-Host "  Maintenance mode ON - OK" -ForegroundColor Green
+            $results += [PSCustomObject]@{
+                MachineName       = $machine.DNSName
+                Action            = "MM-ON"
+                Status            = "Success"
+                SessionCount      = $machine.SessionCount
+                InMaintenanceMode = $machine.InMaintenanceMode
+                RegistrationState = $machine.RegistrationState
+                FoundOnDDC        = $adminAddress
+                PerformedBy       = $currentUser
+                Reason            = $reason
+                Timestamp         = (Get-Date)
+            }
+        } else {
+            $failCount++
+            $results += [PSCustomObject]@{
+                MachineName       = $format
+                Action            = "MM-ON"
+                Status            = "Failed"
+                SessionCount      = "N/A"
+                InMaintenanceMode = "N/A"
+                RegistrationState = "N/A"
+                FoundOnDDC        = $adminAddress
+                PerformedBy       = $currentUser
+                Reason            = $reason
+                Timestamp         = (Get-Date)
+            }
+        }
+
+        $found = $true
+        break  # already handled - no need to check remaining DDCs
     }
+
     if (-not $found) {
+        $notFoundCount++
+        Write-Host "  Not found as Registered on any DDC in list." -ForegroundColor Yellow
         $results += [PSCustomObject]@{
-            MachineName     = $machineName
-            SessionCount    = "Not found"
-            InMaintenanceMode      = "Not found"
-            RegistrationState      = "Not found"
-            FoundOnDDC      = "Not found"
+            MachineName       = $machineName
+            Action            = "MM-ON"
+            Status            = "Not Found"
+            SessionCount      = "N/A"
+            InMaintenanceMode = "N/A"
+            RegistrationState = "N/A"
+            FoundOnDDC        = "N/A"
+            PerformedBy       = $currentUser
+            Reason            = $reason
+            Timestamp         = (Get-Date)
         }
     }
 }
+
 $results
-# Exportar a CSV
-$results | Export-Csv -Path "Results.csv" -NoTypeInformation -Encoding UTF8
+
+Write-Host ""
+Write-Host "===== SUMMARY =====" -ForegroundColor Cyan
+Write-Host "Total servers requested : $($machineNames.Count)"
+Write-Host "Successful              : $successCount" -ForegroundColor Green
+Write-Host "Failed                  : $failCount" -ForegroundColor Red
+Write-Host "Not Found               : $notFoundCount" -ForegroundColor Yellow
+
+$csvPath = "$scriptDir\Results_MaintenanceOn.csv"
+$results | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8 -Append
+Write-Host ""
+Write-Host "Results appended to $csvPath"
